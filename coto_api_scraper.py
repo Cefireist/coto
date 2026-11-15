@@ -16,156 +16,175 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-def crear_sesion_robusta(reintentos_http=3, backoff_factor=1.5):
+def create_robust_session(http_retries=3, backoff_factor=1.5):
     """
     Create an HTTP session that reuses connections and retries network errors
     and server load-related status codes (429, 5xx).
     """
-    sesion = requests.Session()
-    sesion.headers.update({
+    session = requests.Session()
+    session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
         'Accept': 'application/json'
     })
 
-    estrategia_retry = Retry(
-        total=reintentos_http,
+    retry_strategy = Retry(
+        total=http_retries,
         backoff_factor=backoff_factor,  # Delays: 1.5s, 3s, 6s...
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
         raise_on_status=False
     )
 
-    adapter = HTTPAdapter(max_retries=estrategia_retry)
-    sesion.mount("https://", adapter)
-    sesion.mount("http://", adapter)
-    return sesion
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
-def hacer_peticion_segura(sesion, url, params, max_intentos_app=3, timeout=20):
+def make_safe_request(session, url, params, max_app_attempts=3, timeout=20):
     """
     Send a GET request and validate the HTTP status and JSON response.
     Retry if the server returns non-JSON content or the request times out.
     """
-    for intento in range(1, max_intentos_app + 1):
+    for attempt in range(1, max_app_attempts + 1):
         try:
-            respuesta = sesion.get(url, params=params, timeout=timeout)
-            respuesta.raise_for_status()
-            return respuesta.json()
-        except (requests.exceptions.RequestException, ValueError) as e:
+            response = session.get(url, params=params, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except (requests.exceptions.RequestException, ValueError) as error:
             # ValueError also covers requests.exceptions.JSONDecodeError.
-            if intento == max_intentos_app:
-                logging.error(f"Fallo definitivo tras {max_intentos_app} intentos en {params}: {e}")
+            if attempt == max_app_attempts:
+                logging.error(
+                    f"Request failed after {max_app_attempts} attempts with params {params}: {error}"
+                )
                 return None
-            espera = 2 ** intento
-            logging.warning(f"Intento {intento}/{max_intentos_app} fallido ({e}). Reintentando en {espera}s...")
-            time.sleep(espera)
+            wait_seconds = 2 ** attempt
+            logging.warning(
+                f"Attempt {attempt}/{max_app_attempts} failed ({error}). "
+                f"Retrying in {wait_seconds}s..."
+            )
+            time.sleep(wait_seconds)
     return None
 
-def obtener_catv_desde_url(url_web):
+def extract_category_id_from_url(web_url):
     """Extract the category code (e.g. catv00003539) from the browser URL."""
-    match = re.search(r'(catv\d+)', url_web)
+    match = re.search(r'(catv\d+)', web_url)
     if not match:
-        raise ValueError(f"No se encontró un código 'catv' válido en la URL: {url_web}")
+        raise ValueError(f"No valid 'catv' category code was found in URL: {web_url}")
     return match.group(1)
 
-def scrapear_categoria_raw(url_web, momento_captura=None, delay_segundos=0.5, sesion=None):
-    catv_id = obtener_catv_desde_url(url_web)
-    api_url = f"https://api.coto.com.ar/api/v1/ms-digital-sitio-bff-web/api/v1/products/categories/{catv_id}"
+def scrape_category_raw(web_url, capture_time=None, delay_seconds=0.5, session=None):
+    category_id = extract_category_id_from_url(web_url)
+    api_url = f"https://api.coto.com.ar/api/v1/ms-digital-sitio-bff-web/api/v1/products/categories/{category_id}"
 
-    if momento_captura is None:
-        momento_captura = datetime.now().astimezone()
+    if capture_time is None:
+        capture_time = datetime.now().astimezone()
 
-    cerrar_sesion_al_final = False
-    if sesion is None:
-        sesion = crear_sesion_robusta()
-        cerrar_sesion_al_final = True
+    close_session_at_end = False
+    if session is None:
+        session = create_robust_session()
+        close_session_at_end = True
 
-    resultados_por_pagina = 24
+    products_per_page = 24
     params = {
         'page': 1,
         'key': 'key_r6xzz4IAoTWcipni',
-        'num_results_per_page': resultados_por_pagina,
+        'num_results_per_page': products_per_page,
         'pre_filter_expression': '{"name":"store_availability","value":"200"}'
     }
 
-    fecha_hoy = momento_captura.strftime("%Y-%m-%d")
-    timestamp_captura = momento_captura.isoformat(timespec="seconds")
-    registros_crudos = []
-    pagina_actual = 1
-    total_paginas = 1
-    paginas_fallidas = []
+    capture_date = capture_time.strftime("%Y-%m-%d")
+    capture_timestamp = capture_time.isoformat(timespec="seconds")
+    raw_records = []
+    current_page = 1
+    total_pages = 1
+    failed_pages = []
 
-    logging.info(f"Iniciando extracción para categoría: {catv_id}")
+    logging.info(f"Starting extraction for category: {category_id}")
 
     try:
-        while pagina_actual <= total_paginas:
-            params['page'] = pagina_actual
-            logging.info(f"  -> Descargando página {pagina_actual} de {total_paginas}...")
+        while current_page <= total_pages:
+            params['page'] = current_page
+            logging.info(f"  -> Downloading page {current_page} of {total_pages}...")
 
-            datos_json = hacer_peticion_segura(sesion, api_url, params)
+            response_json = make_safe_request(session, api_url, params)
 
-            if datos_json is None:
-                paginas_fallidas.append(pagina_actual)
-                if pagina_actual == 1:
-                    logging.error(f"No se pudo obtener la página 1 de {catv_id}. Abortando categoría.")
+            if response_json is None:
+                failed_pages.append(current_page)
+                if current_page == 1:
+                    logging.error(
+                        f"Could not retrieve page 1 for category {category_id}. "
+                        "Aborting category."
+                    )
                     break
-                pagina_actual += 1
+                current_page += 1
                 continue
 
-            response_data = datos_json.get('response', {})
+            response_data = response_json.get('response', {})
 
-            if pagina_actual == 1:
-                total_productos = response_data.get('total_num_results', 0)
-                total_paginas = max(1, math.ceil(total_productos / resultados_por_pagina))
-                logging.info(f"  Total reportado por Coto: {total_productos} productos ({total_paginas} páginas).")
+            if current_page == 1:
+                total_products = response_data.get('total_num_results', 0)
+                total_pages = max(1, math.ceil(total_products / products_per_page))
+                logging.info(
+                    f"  Total reported by Coto: {total_products} products "
+                    f"({total_pages} pages)."
+                )
 
-            resultados = response_data.get('results', [])
-            if not resultados:
+            results = response_data.get('results', [])
+            if not results:
                 break
 
-            for item in resultados:
-                fila_raw = item.get('data', {}).copy()
-                fila_raw['_fecha_captura'] = fecha_hoy
-                fila_raw['_timestamp_captura'] = timestamp_captura
-                fila_raw['_catv_consultado'] = catv_id
-                registros_crudos.append(fila_raw)
+            for item in results:
+                raw_row = item.get('data', {}).copy()
+                raw_row['_capture_date'] = capture_date
+                raw_row['_capture_timestamp'] = capture_timestamp
+                raw_row['_queried_category_id'] = category_id
+                raw_records.append(raw_row)
 
-            pagina_actual += 1
-            if pagina_actual <= total_paginas:
-                time.sleep(delay_segundos)
+            current_page += 1
+            if current_page <= total_pages:
+                time.sleep(delay_seconds)
     finally:
-        if cerrar_sesion_al_final:
-            sesion.close()
+        if close_session_at_end:
+            session.close()
 
-    if paginas_fallidas:
-        logging.warning(f"Categoría {catv_id} finalizada con páginas fallidas: {paginas_fallidas}")
+    if failed_pages:
+        logging.warning(
+            f"Category {category_id} finished with failed pages: {failed_pages}"
+        )
 
-    df_raw = pd.DataFrame(registros_crudos)
+    raw_df = pd.DataFrame(raw_records)
 
-    if not df_raw.empty and 'sku_id' in df_raw.columns:
-        antes = len(df_raw)
-        df_raw = df_raw.drop_duplicates(subset=['sku_id'], keep='first')
-        logging.info(f"Limpieza de solapamiento: {antes} -> {len(df_raw)} productos únicos.")
+    if not raw_df.empty and 'sku_id' in raw_df.columns:
+        rows_before_deduplication = len(raw_df)
+        raw_df = raw_df.drop_duplicates(subset=['sku_id'], keep='first')
+        logging.info(
+            f"Removed overlapping products: {rows_before_deduplication} "
+            f"-> {len(raw_df)} unique products."
+        )
 
-    return df_raw
+    return raw_df
 
 if __name__ == "__main__":
-    url_golosinas = "https://www.cotodigital.com.ar/sitios/cdigi/productos/categorias/catalogo-almac%C3%A9n-golosinas/catv00003539"
+    golosinas_url = "https://www.cotodigital.com.ar/sitios/cdigi/productos/categorias/catalogo-almac%C3%A9n-golosinas/catv00003539"
 
-    momento_captura = datetime.now().astimezone()
-    df_golosinas = scrapear_categoria_raw(url_golosinas, momento_captura, delay_segundos=0.5)
+    capture_time = datetime.now().astimezone()
+    golosinas_df = scrape_category_raw(golosinas_url, capture_time, delay_seconds=0.5)
 
-    if df_golosinas.empty:
-        logging.error("No se extrajeron datos. No se generará el archivo Parquet.")
+    if golosinas_df.empty:
+        logging.error("No data was extracted. The Parquet file will not be created.")
     else:
-        directorio_salida = Path(__file__).resolve().parent / "raw_db"
-        directorio_salida.mkdir(parents=True, exist_ok=True)
-        timestamp_archivo = momento_captura.strftime("%Y%m%d_%H%M%S")
-        nombre_archivo = directorio_salida / f"coto_raw_golosinas_{timestamp_archivo}.parquet"
+        output_directory = Path(__file__).resolve().parent / "raw_db"
+        output_directory.mkdir(parents=True, exist_ok=True)
+        filename_timestamp = capture_time.strftime("%Y%m%d_%H%M%S")
+        output_path = output_directory / f"coto_raw_golosinas_{filename_timestamp}.parquet"
 
-        cols_object = df_golosinas.select_dtypes(include=["object"]).columns
-        df_golosinas[cols_object] = df_golosinas[cols_object].astype("string")
+        object_columns = golosinas_df.select_dtypes(include=["object"]).columns
+        golosinas_df[object_columns] = golosinas_df[object_columns].astype("string")
 
-        df_golosinas.to_parquet(nombre_archivo, index=False)
+        golosinas_df.to_parquet(output_path, index=False)
 
-        logging.info(f"Archivo guardado exitosamente: {nombre_archivo}")
-        logging.info(f"Columnas capturadas ({len(df_golosinas.columns)}): {list(df_golosinas.columns)}")
+        logging.info(f"File saved successfully: {output_path}")
+        logging.info(
+            f"Captured {len(golosinas_df.columns)} columns: "
+            f"{list(golosinas_df.columns)}"
+        )
